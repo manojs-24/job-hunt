@@ -8,7 +8,7 @@ from openpyxl.utils import get_column_letter
 from .providers.base import provider_names
 
 COLUMNS = [
-    ("title", "Title"), ("company", "Company"), ("location", "Location"),
+    ("title", "Title"), ("company", "Company"), ("company_kind", "Company type"), ("location", "Location"),
     ("exp_required", "Experience required (yrs)"), ("salary", "Salary"),
     ("posted_at", "Posted"), ("source", "Source"), ("score", "Score"),
     ("reason", "Reason"), ("skills_matched", "Skills you match"),

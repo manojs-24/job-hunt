@@ -114,3 +114,91 @@ def run_resume_search(roles: list[str], skills: list[str], experience: float, lo
         "ids": [j["id"] for j in unique if "id" in j],
         "new_ids": [j["id"] for j in new_jobs],
     }
+
+
+# --- startups and remote: company careers pages + free remote job boards --------------------------
+from .providers import careers, remote_boards   # noqa: E402
+from .relevance import Matcher, rank              # noqa: E402
+
+MAX_NEW_PER_RUN = 60     # the most new jobs saved (and sent to Claude for scoring) in one run
+
+
+async def _fetch_startup_sources(companies: list[dict], roles: list[str], include_remote: bool,
+                                 location: str = ""):
+    async with httpx.AsyncClient() as client:
+        tasks = ([careers.search_companies(client, companies, location=location, include_remote=include_remote)]
+                 if companies else [])
+        if include_remote:
+            tasks.append(remote_boards.search_remote_boards(client, roles, location))
+        results = await asyncio.gather(*tasks)
+    company_out = results[0] if companies else {"jobs": [], "per_company": {}}
+    remote_jobs, remote_report = results[-1] if include_remote else ([], {})
+    return company_out, remote_jobs, remote_report
+
+
+def run_startup_search(roles: list[str], experience: float, skills: list[str] | None = None, *,
+                       location: str = "", company_ids: list[int] | None = None, include_remote: bool = True,
+                       days: int | None = None, max_new: int = MAX_NEW_PER_RUN) -> dict:
+    """Read the watchlist's careers pages (and the remote boards), keep jobs in `location` whose
+    title fits the roles, save the best new ones and have Claude score them.
+
+    `location` is a city, state or country, several separated by commas ("Bengaluru, Pune"), or
+    blank for anywhere in India. `include_remote` also keeps jobs anyone can do from home.
+
+    Free for the APIs: no JSearch / SerpApi / OpenWeb Ninja credit is used. Claude is called only
+    for the (at most `max_new`) new jobs that survive the title match.
+    """
+    roles = [r.strip() for r in roles if r.strip()]
+    conn = db.connect()
+    try:
+        companies = [c for c in db.list_companies(conn, enabled=True)
+                     if company_ids is None or c["id"] in company_ids]
+    finally:
+        conn.close()
+
+    location = location.strip()
+    company_out, remote_jobs, remote_report = asyncio.run(
+        _fetch_startup_sources(companies, roles, include_remote, location))
+    fetched = company_out["jobs"] + remote_jobs
+
+    matcher = Matcher(roles, skills)
+    kept = []
+    for job in fetched:
+        if too_old(job, days) or not job.get("title") or not job.get("company"):
+            continue
+        m = matcher.score(job["title"])
+        if m > 0:
+            job["_rank"] = rank(job["title"], m, experience)
+            kept.append(job)
+    kept.sort(key=lambda j: -j["_rank"])
+    unique, batch_dupes = dedupe_batch(kept)
+    unique.sort(key=lambda j: -j["_rank"])          # best title match first, so the cap keeps the best
+
+    label = " / ".join(roles)[:200] or "Startups"
+    conn = db.connect()
+    try:
+        for cid, info in company_out["per_company"].items():
+            db.record_company_check(conn, cid, info["total"], info["detail"] if info["status"] == "error" else None)
+        where = location or "India"
+        new_jobs = db.insert_new(conn, unique, label, where, limit_new=max_new)
+        scores, notice = score_jobs(label, experience, new_jobs, skills=skills or None)
+        db.save_scores(conn, scores)
+        db.record_search(conn, label, experience, where, len(fetched), len(new_jobs))
+    finally:
+        conn.close()
+
+    saved_ids = [j["id"] for j in unique if "id" in j]
+    return {
+        "per_company": company_out["per_company"],
+        "remote": remote_report,
+        "companies_checked": len(companies),
+        "fetched": len(fetched),
+        "matched_title": len(kept),
+        "duplicates_in_batch": batch_dupes,
+        "new_count": len(new_jobs),
+        "already_seen": len(saved_ids) - len(new_jobs),
+        "left_for_later": len(unique) - len(saved_ids),
+        "notice": notice,
+        "ids": saved_ids,
+        "new_ids": [j["id"] for j in new_jobs],
+    }

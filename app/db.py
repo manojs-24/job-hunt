@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     reason TEXT,
     skills_matched TEXT,
     skills_missing TEXT,
+    company_kind TEXT,
     saved INTEGER NOT NULL DEFAULT 0,
     saved_at TEXT,
     applied INTEGER NOT NULL DEFAULT 0,
@@ -47,6 +48,26 @@ CREATE TABLE IF NOT EXISTS profiles (
     created_at TEXT NOT NULL,
     last_run_at TEXT
 );
+CREATE TABLE IF NOT EXISTS companies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    board TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'Startup',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_checked TEXT,
+    last_total INTEGER,
+    last_error TEXT,
+    UNIQUE (board, slug)
+);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS board_lookups (
+    company_key TEXT PRIMARY KEY,
+    board TEXT,
+    slug TEXT,
+    how TEXT,
+    checked_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS searches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     role TEXT, experience REAL, location TEXT,
@@ -63,6 +84,7 @@ ADDED_COLUMNS = {
     "found_by": "TEXT",
     "skills_matched": "TEXT",
     "skills_missing": "TEXT",
+    "company_kind": "TEXT",
 }
 
 
@@ -85,6 +107,7 @@ def connect(path=None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     _migrate(conn)
+    _seed_companies(conn)
     return conn
 
 
@@ -99,11 +122,14 @@ def _merge_found_by(existing: str | None, new: set[str]) -> str:
     return ",".join(sorted({p for p in (existing or "").split(",") if p} | new))
 
 
-def insert_new(conn: sqlite3.Connection, jobs: list[dict], role: str, location: str) -> list[dict]:
+def insert_new(conn: sqlite3.Connection, jobs: list[dict], role: str, location: str,
+               limit_new: int | None = None) -> list[dict]:
     """Insert jobs not seen before; refresh last_seen on ones we already have.
 
     A job seen again by a different API gets that API added to `found_by`.
-    Returns only the jobs that were newly inserted (each gains an `id`).
+    Returns only the jobs that were newly inserted (each gains an `id`). With `limit_new`, once that
+    many jobs have been inserted the remaining unseen jobs are left alone (no `id`), so a later run
+    can pick them up instead of them being stored without a score.
     """
     ts = now()
     new: list[dict] = []
@@ -121,6 +147,8 @@ def insert_new(conn: sqlite3.Connection, jobs: list[dict], role: str, location: 
                 if similar_title(row["title"], job["title"]):
                     existing = row
                     break
+        if existing is None and limit_new is not None and len(new) >= limit_new:
+            continue
         if existing is not None:
             conn.execute(
                 "UPDATE jobs SET last_seen = ?, found_by = ? WHERE id = ?",
@@ -131,12 +159,12 @@ def insert_new(conn: sqlite3.Connection, jobs: list[dict], role: str, location: 
         cur = conn.execute(
             """INSERT INTO jobs (fingerprint, title, company, company_key, location, remote, salary,
                 posted_at, url, source, provider, found_by, description, query_role, query_location,
-                first_seen, last_seen)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                company_kind, first_seen, last_seen)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (fp, job["title"], job["company"], company_key, job.get("location"),
              int(bool(job.get("remote"))), job.get("salary"), job.get("posted_at"), job.get("url"),
              job.get("source"), job.get("provider"), _merge_found_by(None, providers),
-             job.get("description"), role, location, ts, ts),
+             job.get("description"), role, location, job.get("company_kind"), ts, ts),
         )
         job["id"] = cur.lastrowid
         new.append(job)
@@ -176,9 +204,9 @@ def _like(text: str) -> str:
 
 def query_jobs(conn, *, role=None, location=None, min_score=None, only_ids=None,
                saved=None, applied=None, found_by=None, q=None, source=None, since=None,
-               sort="score") -> list[dict]:
+               kind=None, sort="score") -> list[dict]:
     sql = ("SELECT id, title, company, location, remote, salary, posted_at, url, source, provider, found_by, "
-           "exp_required, score, reason, skills_matched, skills_missing, saved, applied, first_seen "
+           "exp_required, score, reason, skills_matched, skills_missing, company_kind, saved, applied, first_seen "
            "FROM jobs WHERE 1=1")
     args: list = []
     if role:
@@ -206,6 +234,9 @@ def query_jobs(conn, *, role=None, location=None, min_score=None, only_ids=None,
     if source:
         sql += " AND source = ? COLLATE NOCASE"
         args.append(source)
+    if kind:
+        sql += " AND company_kind = ? COLLATE NOCASE"
+        args.append(kind)
     if since:
         sql += " AND first_seen >= ?"      # first_seen is an ISO timestamp, so text comparison orders correctly
         args.append(since)
@@ -306,3 +337,103 @@ def delete_profile(conn: sqlite3.Connection, profile_id: int) -> bool:
     cur = conn.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
     conn.commit()
     return cur.rowcount > 0
+
+
+# --- company watchlist (careers pages) and small key/value settings ------------------------------
+def meta_get(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                 (key, value))
+    conn.commit()
+
+
+def _seed_companies(conn: sqlite3.Connection) -> None:
+    """Fill the watchlist once. Companies the user later removes stay removed."""
+    if meta_get(conn, "companies_seeded"):
+        return
+    from .seed_companies import SEED
+    conn.executemany("INSERT OR IGNORE INTO companies (name, board, slug, kind) VALUES (?,?,?,?)", SEED)
+    conn.commit()
+    meta_set(conn, "companies_seeded", now())
+
+
+def list_companies(conn: sqlite3.Connection, enabled: bool | None = None) -> list[dict]:
+    sql = "SELECT * FROM companies"
+    args: list = []
+    if enabled is not None:
+        sql += " WHERE enabled = ?"
+        args.append(int(enabled))
+    return [dict(r) for r in conn.execute(sql + " ORDER BY name COLLATE NOCASE", args)]
+
+
+def add_company(conn: sqlite3.Connection, name: str, board: str, slug: str, kind: str = "Startup") -> int | None:
+    """Add a company; returns its id, or None when that board/slug is already on the list."""
+    try:
+        cur = conn.execute("INSERT INTO companies (name, board, slug, kind) VALUES (?,?,?,?)",
+                           (name.strip(), board, slug.strip().lower(), kind))
+    except sqlite3.IntegrityError:
+        return None
+    conn.commit()
+    return cur.lastrowid
+
+
+def update_company(conn: sqlite3.Connection, company_id: int, *, enabled: bool | None = None,
+                   kind: str | None = None) -> None:
+    if enabled is not None:
+        conn.execute("UPDATE companies SET enabled = ? WHERE id = ?", (int(enabled), company_id))
+    if kind is not None:
+        conn.execute("UPDATE companies SET kind = ? WHERE id = ?", (kind, company_id))
+    conn.commit()
+
+
+def record_company_check(conn: sqlite3.Connection, company_id: int, total: int | None, error: str | None) -> None:
+    conn.execute("UPDATE companies SET last_checked = ?, last_total = ?, last_error = ? WHERE id = ?",
+                 (now(), total, error, company_id))
+    conn.commit()
+
+
+def delete_companies(conn: sqlite3.Connection, ids: list[int]) -> int:
+    if not ids:
+        return 0
+    cur = conn.execute(f"DELETE FROM companies WHERE id IN ({','.join('?' * len(ids))})", ids)
+    conn.commit()
+    return cur.rowcount
+
+
+# --- finding companies: employers seen in a place, and which careers page each one uses ------------
+def employers_in_location(conn: sqlite3.Connection, is_here, limit: int = 200) -> dict[str, dict]:
+    """Employers with at least one saved job whose location passes `is_here(location)`.
+
+    Returns {company_key: {"name", "jobs": [{title, url, location, seen}]}}, busiest employers first.
+    """
+    out: dict[str, dict] = {}
+    rows = conn.execute("SELECT company, company_key, title, location, url, first_seen FROM jobs "
+                        "ORDER BY first_seen DESC")
+    for r in rows:
+        if not r["company_key"] or not is_here(r["location"]):
+            continue
+        entry = out.setdefault(r["company_key"], {"name": r["company"], "jobs": []})
+        entry["jobs"].append({"title": r["title"], "url": r["url"], "location": r["location"],
+                              "seen": r["first_seen"]})
+    busiest = sorted(out.items(), key=lambda kv: -len(kv[1]["jobs"]))[:limit]
+    return dict(busiest)
+
+
+def get_board_lookup(conn: sqlite3.Connection, company_key: str) -> dict | None:
+    row = conn.execute("SELECT * FROM board_lookups WHERE company_key = ?", (company_key,)).fetchone()
+    return dict(row) if row else None
+
+
+def set_board_lookup(conn: sqlite3.Connection, company_key: str, board: str | None, slug: str | None,
+                     how: str | None) -> None:
+    """Remember which careers page a company uses, or (board=None) that none could be found."""
+    conn.execute(
+        "INSERT INTO board_lookups (company_key, board, slug, how, checked_at) VALUES (?,?,?,?,?) "
+        "ON CONFLICT(company_key) DO UPDATE SET board = excluded.board, slug = excluded.slug, "
+        "how = excluded.how, checked_at = excluded.checked_at",
+        (company_key, board, slug, how, now()))
+    conn.commit()

@@ -8,6 +8,8 @@ pages = [
     st.Page("views/dashboard.py", title="Dashboard", icon=":material/dashboard:", default=True),
     st.Page("views/search.py", title="Search jobs", icon=":material/search:"),
     st.Page("views/resume_match.py", title="Match my resume", icon=":material/description:"),
+    st.Page("views/startups.py", title="Startups & remote", icon=":material/rocket_launch:"),
+    st.Page("views/companies.py", title="Find companies", icon=":material/business:"),
     st.Page("views/all_jobs.py", title="All jobs", icon=":material/table:"),
 ]
 page = st.navigation(pages)

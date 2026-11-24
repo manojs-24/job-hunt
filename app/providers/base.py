@@ -1,7 +1,26 @@
+import html
+import re
+
 import httpx
 
+PROVIDER_LABELS = {
+    "jsearch": "JSearch", "serpapi": "SerpApi", "openwebninja": "OpenWeb Ninja",
+    "greenhouse": "Greenhouse", "lever": "Lever", "ashby": "Ashby",
+    "smartrecruiters": "SmartRecruiters", "workable": "Workable",
+    "remoteok": "Remote OK", "remotive": "Remotive",
+}
 
-PROVIDER_LABELS = {"jsearch": "JSearch", "serpapi": "SerpApi", "openwebninja": "OpenWeb Ninja"}
+
+def html_to_text(raw: str | None) -> str:
+    """Job-board HTML to readable text. Greenhouse double-encodes its HTML, so decode before stripping."""
+    if not raw:
+        return ""
+    s = html.unescape(raw)
+    s = re.sub(r"<(br|/p|/li|/h\d|/div)\s*/?>", "\n", s, flags=re.I)
+    s = re.sub(r"<li[^>]*>", "- ", s, flags=re.I)
+    s = html.unescape(re.sub(r"<[^>]+>", "", s))
+    s = re.sub(r"[ \t]+", " ", s)
+    return re.sub(r"\n\s*\n+", "\n\n", s).strip()
 
 
 def provider_names(found_by: str | None) -> str:
