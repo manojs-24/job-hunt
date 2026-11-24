@@ -1,0 +1,12 @@
+[server]
+headless = true          # no first-run email prompt; start.bat opens the browser
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"
+primaryColor = "#4f8cff"
+backgroundColor = "#0e1117"
+secondaryBackgroundColor = "#1a1f2b"
+textColor = "#e6e9ef"
